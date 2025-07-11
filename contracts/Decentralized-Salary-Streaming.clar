@@ -3,6 +3,7 @@
 (define-constant ERR-INSUFFICIENT-BALANCE (err u102))
 (define-constant ERR-INVALID-TIME (err u103))
 (define-constant ERR-STREAM-ENDED (err u104))
+(define-constant ERR-STREAM-PAUSED (err u105))
 
 (define-data-var contract-owner principal tx-sender)
 
@@ -16,6 +17,9 @@
         end-time: uint,
         amount-paid: uint,
         is-active: bool,
+        is-paused: bool,
+        pause-start-time: uint,
+        total-paused-time: uint,
     }
 )
 
@@ -43,13 +47,15 @@
         )
         (if (get is-active stream)
             (let (
-                    (elapsed-time (- current-time (get start-time stream)))
+                    (effective-elapsed-time (- current-time (get start-time stream)))
+                    (total-paused-time (get total-paused-time stream))
+                    (adjusted-elapsed-time (- effective-elapsed-time total-paused-time))
                     (total-duration (- (get end-time stream) (get start-time stream)))
                     (total-amount (get total-amount stream))
                 )
-                (if (>= current-time (get end-time stream))
+                (if (>= adjusted-elapsed-time total-duration)
                     (ok (- total-amount (get amount-paid stream)))
-                    (ok (/ (* elapsed-time total-amount) total-duration))
+                    (ok (/ (* adjusted-elapsed-time total-amount) total-duration))
                 )
             )
             (ok u0)
@@ -86,6 +92,9 @@
             end-time: end-time,
             amount-paid: u0,
             is-active: true,
+            is-paused: false,
+            pause-start-time: u0,
+            total-paused-time: u0,
         })
         (map-set employer-balances { employer: tx-sender } { balance: (- employer-balance total-amount) })
         (var-set stream-nonce stream-id)
@@ -100,6 +109,7 @@
         )
         (asserts! (is-eq tx-sender (get employee stream)) ERR-NOT-AUTHORIZED)
         (asserts! (get is-active stream) ERR-STREAM-ENDED)
+        (asserts! (not (get is-paused stream)) ERR-STREAM-PAUSED)
         (asserts! (> available-amount u0) ERR-INSUFFICIENT-BALANCE)
         (try! (as-contract (stx-transfer? available-amount tx-sender (get employee stream))))
         (map-set salary-streams { stream-id: stream-id }
@@ -109,5 +119,41 @@
             })
         )
         (ok available-amount)
+    )
+)
+
+(define-public (pause-stream (stream-id uint))
+    (let (
+            (stream (unwrap! (get-stream stream-id) ERR-STREAM-NOT-FOUND))
+        )
+        (asserts! (is-eq tx-sender (get employer stream)) ERR-NOT-AUTHORIZED)
+        (asserts! (get is-active stream) ERR-STREAM-ENDED)
+        (asserts! (not (get is-paused stream)) ERR-STREAM-PAUSED)
+        (map-set salary-streams { stream-id: stream-id }
+            (merge stream {
+                is-paused: true,
+                pause-start-time: burn-block-height,
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (resume-stream (stream-id uint))
+    (let (
+            (stream (unwrap! (get-stream stream-id) ERR-STREAM-NOT-FOUND))
+            (pause-duration (- burn-block-height (get pause-start-time stream)))
+        )
+        (asserts! (is-eq tx-sender (get employer stream)) ERR-NOT-AUTHORIZED)
+        (asserts! (get is-active stream) ERR-STREAM-ENDED)
+        (asserts! (get is-paused stream) ERR-STREAM-PAUSED)
+        (map-set salary-streams { stream-id: stream-id }
+            (merge stream {
+                is-paused: false,
+                pause-start-time: u0,
+                total-paused-time: (+ (get total-paused-time stream) pause-duration),
+            })
+        )
+        (ok true)
     )
 )
