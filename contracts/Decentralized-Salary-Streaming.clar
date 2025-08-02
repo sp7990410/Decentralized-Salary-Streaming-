@@ -4,6 +4,7 @@
 (define-constant ERR-INVALID-TIME (err u103))
 (define-constant ERR-STREAM-ENDED (err u104))
 (define-constant ERR-STREAM-PAUSED (err u105))
+(define-constant ERR-STREAM-TERMINATED (err u106))
 
 (define-data-var contract-owner principal tx-sender)
 
@@ -20,6 +21,7 @@
         is-paused: bool,
         pause-start-time: uint,
         total-paused-time: uint,
+        is-terminated: bool,
     }
 )
 
@@ -45,7 +47,7 @@
             (stream (unwrap! (get-stream stream-id) ERR-STREAM-NOT-FOUND))
             (current-time burn-block-height)
         )
-        (if (get is-active stream)
+        (if (and (get is-active stream) (not (get is-terminated stream)))
             (let (
                     (effective-elapsed-time (- current-time (get start-time stream)))
                     (total-paused-time (get total-paused-time stream))
@@ -95,6 +97,7 @@
             is-paused: false,
             pause-start-time: u0,
             total-paused-time: u0,
+            is-terminated: false,
         })
         (map-set employer-balances { employer: tx-sender } { balance: (- employer-balance total-amount) })
         (var-set stream-nonce stream-id)
@@ -110,6 +113,7 @@
         (asserts! (is-eq tx-sender (get employee stream)) ERR-NOT-AUTHORIZED)
         (asserts! (get is-active stream) ERR-STREAM-ENDED)
         (asserts! (not (get is-paused stream)) ERR-STREAM-PAUSED)
+        (asserts! (not (get is-terminated stream)) ERR-STREAM-TERMINATED)
         (asserts! (> available-amount u0) ERR-INSUFFICIENT-BALANCE)
         (try! (as-contract (stx-transfer? available-amount tx-sender (get employee stream))))
         (map-set salary-streams { stream-id: stream-id }
@@ -123,12 +127,11 @@
 )
 
 (define-public (pause-stream (stream-id uint))
-    (let (
-            (stream (unwrap! (get-stream stream-id) ERR-STREAM-NOT-FOUND))
-        )
+    (let ((stream (unwrap! (get-stream stream-id) ERR-STREAM-NOT-FOUND)))
         (asserts! (is-eq tx-sender (get employer stream)) ERR-NOT-AUTHORIZED)
         (asserts! (get is-active stream) ERR-STREAM-ENDED)
         (asserts! (not (get is-paused stream)) ERR-STREAM-PAUSED)
+        (asserts! (not (get is-terminated stream)) ERR-STREAM-TERMINATED)
         (map-set salary-streams { stream-id: stream-id }
             (merge stream {
                 is-paused: true,
@@ -147,6 +150,7 @@
         (asserts! (is-eq tx-sender (get employer stream)) ERR-NOT-AUTHORIZED)
         (asserts! (get is-active stream) ERR-STREAM-ENDED)
         (asserts! (get is-paused stream) ERR-STREAM-PAUSED)
+        (asserts! (not (get is-terminated stream)) ERR-STREAM-TERMINATED)
         (map-set salary-streams { stream-id: stream-id }
             (merge stream {
                 is-paused: false,
@@ -155,5 +159,45 @@
             })
         )
         (ok true)
+    )
+)
+
+(define-public (terminate-stream (stream-id uint))
+    (let (
+            (stream (unwrap! (get-stream stream-id) ERR-STREAM-NOT-FOUND))
+            (available-amount (unwrap! (calculate-streamed-amount stream-id) ERR-STREAM-NOT-FOUND))
+            (remaining-amount (- (get total-amount stream) (get amount-paid stream)
+                available-amount
+            ))
+        )
+        (asserts!
+            (or (is-eq tx-sender (get employer stream)) (is-eq tx-sender (get employee stream)))
+            ERR-NOT-AUTHORIZED
+        )
+        (asserts! (get is-active stream) ERR-STREAM-ENDED)
+        (asserts! (not (get is-terminated stream)) ERR-STREAM-TERMINATED)
+        (if (> available-amount u0)
+            (try! (as-contract (stx-transfer? available-amount tx-sender (get employee stream))))
+            true
+        )
+        (if (> remaining-amount u0)
+            (map-set employer-balances { employer: (get employer stream) } { balance: (+ (get balance (get-employer-balance (get employer stream)))
+                remaining-amount
+            ) }
+            )
+            true
+        )
+        (map-set salary-streams { stream-id: stream-id }
+            (merge stream {
+                is-terminated: true,
+                is-active: false,
+                is-paused: false,
+                amount-paid: (+ (get amount-paid stream) available-amount),
+            })
+        )
+        (ok {
+            employee-payment: available-amount,
+            employer-refund: remaining-amount,
+        })
     )
 )
