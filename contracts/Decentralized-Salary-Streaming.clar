@@ -311,3 +311,249 @@
         })
     )
 )
+
+;; ============================================
+;; STREAM ANALYTICS DASHBOARD FEATURE
+;; ============================================
+
+(define-constant ERR-INVALID-PERIOD (err u107))
+(define-constant ERR-ANALYTICS-ACCESS-DENIED (err u108))
+
+;; Daily analytics tracking
+(define-map daily-analytics
+    { date: uint }
+    {
+        streams-created: uint,
+        total-volume: uint,
+        payments-made: uint,
+        completion-rate: uint,
+        average-stream-duration: uint,
+        unique-employers: uint,
+        unique-employees: uint,
+    }
+)
+
+;; Stream performance categories
+(define-map stream-performance
+    { stream-id: uint }
+    {
+        efficiency-score: uint,
+        payment-consistency: uint,
+        utilization-rate: uint,
+        risk-category: (string-ascii 10),
+        performance-tier: (string-ascii 10),
+    }
+)
+
+;; Employee analytics
+(define-map employee-analytics
+    { employee: principal }
+    {
+        total-streams-received: uint,
+        total-earnings: uint,
+        average-stream-value: uint,
+        on-time-withdrawals: uint,
+        delayed-withdrawals: uint,
+        reliability-score: uint,
+    }
+)
+
+(define-private (calculate-efficiency-score (stream-id uint))
+    (let (
+            (stream (unwrap! (get-stream stream-id) (err u0)))
+            (total-duration (- (get end-time stream) (get start-time stream)))
+            (paused-time (get total-paused-time stream))
+            (active-time (- total-duration paused-time))
+        )
+        (if (> total-duration u0)
+            (ok (/ (* active-time u100) total-duration))
+            (ok u0)
+        )
+    )
+)
+
+(define-private (update-daily-analytics (metric-type (string-ascii 20)) (amount uint))
+    (let (
+            (current-date burn-block-height)
+            (current-analytics (default-to {
+                streams-created: u0,
+                total-volume: u0,
+                payments-made: u0,
+                completion-rate: u0,
+                average-stream-duration: u0,
+                unique-employers: u0,
+                unique-employees: u0,
+            } (map-get? daily-analytics { date: current-date })))
+        )
+        (map-set daily-analytics { date: current-date }
+            (if (is-eq metric-type "stream-created")
+                (merge current-analytics {
+                    streams-created: (+ (get streams-created current-analytics) u1),
+                    total-volume: (+ (get total-volume current-analytics) amount),
+                })
+                (if (is-eq metric-type "payment-made")
+                    (merge current-analytics {
+                        payments-made: (+ (get payments-made current-analytics) u1),
+                    })
+                    current-analytics
+                )
+            ))
+    )
+)
+
+(define-private (categorize-stream-risk (stream-id uint))
+    (let (
+            (stream (unwrap! (get-stream stream-id) (err "none")))
+            (efficiency (unwrap-panic (calculate-efficiency-score stream-id)))
+            (pause-events (get total-pause-events (get-employer-metrics (get employer stream))))
+        )
+        (if (and (>= efficiency u90) (<= pause-events u1))
+            (ok "low")
+            (if (and (>= efficiency u70) (<= pause-events u3))
+                (ok "medium")
+                (ok "high")
+            )
+        )
+    )
+)
+
+(define-public (update-stream-performance (stream-id uint))
+    (let (
+            (stream (unwrap! (get-stream stream-id) ERR-STREAM-NOT-FOUND))
+            (efficiency (unwrap-panic (calculate-efficiency-score stream-id)))
+            (risk-category (unwrap-panic (categorize-stream-risk stream-id)))
+            (total-amount (get total-amount stream))
+            (amount-paid (get amount-paid stream))
+            (utilization (if (> total-amount u0) (/ (* amount-paid u100) total-amount) u0))
+        )
+        (asserts!
+            (or (is-eq tx-sender (get employer stream)) 
+                (is-eq tx-sender (get employee stream))
+                (is-eq tx-sender (var-get contract-owner)))
+            ERR-ANALYTICS-ACCESS-DENIED
+        )
+        (map-set stream-performance { stream-id: stream-id } {
+            efficiency-score: efficiency,
+            payment-consistency: (if (> (get total-amount-paid (get-employer-metrics (get employer stream))) u0) u100 u0),
+            utilization-rate: utilization,
+            risk-category: risk-category,
+            performance-tier: (if (>= efficiency u90) "premium" 
+                             (if (>= efficiency u75) "standard" "basic")),
+        })
+        (ok true)
+    )
+)
+
+(define-public (update-employee-analytics (employee principal) (stream-id uint) (withdrawal-amount uint))
+    (let (
+            (stream (unwrap! (get-stream stream-id) ERR-STREAM-NOT-FOUND))
+            (current-analytics (default-to {
+                total-streams-received: u0,
+                total-earnings: u0,
+                average-stream-value: u0,
+                on-time-withdrawals: u0,
+                delayed-withdrawals: u0,
+                reliability-score: u85,
+            } (map-get? employee-analytics { employee: employee })))
+            (new-total-earnings (+ (get total-earnings current-analytics) withdrawal-amount))
+            (new-stream-count (+ (get total-streams-received current-analytics) u1))
+        )
+        (asserts! (is-eq tx-sender employee) ERR-NOT-AUTHORIZED)
+        (map-set employee-analytics { employee: employee } 
+            (merge current-analytics {
+                total-streams-received: new-stream-count,
+                total-earnings: new-total-earnings,
+                average-stream-value: (if (> new-stream-count u0) 
+                                     (/ new-total-earnings new-stream-count) u0),
+                on-time-withdrawals: (+ (get on-time-withdrawals current-analytics) u1),
+            })
+        )
+        (ok true)
+    )
+)
+
+;; ============================================
+;; ANALYTICS READ-ONLY FUNCTIONS
+;; ============================================
+
+(define-read-only (get-stream-performance (stream-id uint))
+    (map-get? stream-performance { stream-id: stream-id })
+)
+
+(define-read-only (get-employee-analytics (employee principal))
+    (map-get? employee-analytics { employee: employee })
+)
+
+(define-read-only (get-daily-analytics (date uint))
+    (map-get? daily-analytics { date: date })
+)
+
+(define-read-only (generate-analytics-report (employer principal))
+    (let (
+            (metrics (get-employer-metrics employer))
+            (completion-rate (if (> (get total-streams-created metrics) u0)
+                            (/ (* (get successful-completions metrics) u100) 
+                               (get total-streams-created metrics)) u0))
+            (termination-rate (if (> (get total-streams-created metrics) u0)
+                             (/ (* (get early-terminations metrics) u100) 
+                                (get total-streams-created metrics)) u0))
+            (efficiency-rating (- u100 (/ (* (get total-pause-events metrics) u10) 
+                                      (+ (get total-streams-created metrics) u1))))
+        )
+        (ok {
+            employer: employer,
+            total-streams: (get total-streams-created metrics),
+            total-volume: (get total-amount-streamed metrics),
+            completion-rate: completion-rate,
+            termination-rate: termination-rate,
+            efficiency-rating: efficiency-rating,
+            risk-assessment: (if (< completion-rate u70) "high-risk" 
+                           (if (< completion-rate u85) "medium-risk" "low-risk")),
+            recommendation: (if (< efficiency-rating u80) "optimize-streaming" "maintain-current"),
+        })
+    )
+)
+
+(define-private (min-value (a uint) (b uint))
+    (if (<= a b) a b)
+)
+
+(define-read-only (get-platform-health-score)
+    (let (
+            (global (get-global-metrics))
+            (total-streams (get total-streams global))
+            (total-volume (get total-volume global))
+            (avg-completion (get average-completion-rate global))
+            (stream-score (if (> total-streams u0) 
+                            (min-value u100 (/ total-streams u10)) u0))
+            (volume-score (if (> total-volume u1000000) u100 
+                            (/ total-volume u10000)))
+        )
+        (ok {
+            platform-utilization: stream-score,
+            volume-health: volume-score,
+            completion-health: avg-completion,
+            overall-score: (/ (+ avg-completion stream-score volume-score) u3),
+            status: (if (> avg-completion u80) "healthy" 
+                   (if (> avg-completion u60) "warning" "critical")),
+        })
+    )
+)
+
+(define-read-only (get-trending-metrics (period uint))
+    (let (
+            (current-date burn-block-height)
+            (period-start (- current-date period))
+        )
+        (asserts! (and (> period u0) (<= period u144)) ERR-INVALID-PERIOD) ;; Max 144 blocks (1 day)
+        (ok {
+            period-days: period,
+            period-start: period-start,
+            period-end: current-date,
+            growth-trend: "positive", ;; Simplified for this implementation
+            volume-trend: "increasing",
+            user-adoption: "steady",
+            recommendation: "continue-growth-strategy",
+        })
+    )
+)
